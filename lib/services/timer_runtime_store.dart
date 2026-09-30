@@ -16,6 +16,9 @@ class TimerRuntimeStore {
   Future<TimerRuntime> load() async {
     await _writeTail;
     final prefs = await SharedPreferences.getInstance();
+    try {
+      await prefs.reload();
+    } catch (_) {}
     final encoded = prefs.getString(runtimeKey);
     if (encoded == null) return TimerRuntime.idle();
     try {
@@ -48,6 +51,9 @@ class TimerRuntimeStore {
   Future<StopwatchRuntime> loadStopwatch() async {
     await _writeTail;
     final prefs = await SharedPreferences.getInstance();
+    try {
+      await prefs.reload();
+    } catch (_) {}
     final encoded = prefs.getString(stopwatchKey);
     if (encoded == null) return StopwatchRuntime.idle();
     try {
@@ -81,6 +87,9 @@ class TimerRuntimeStore {
 
   Future<AppSettings> loadTaskSettings() async {
     final prefs = await SharedPreferences.getInstance();
+    try {
+      await prefs.reload();
+    } catch (_) {}
     AppSettings settings = AppSettings.defaults();
     final encoded = prefs.getString(SettingsService.snapshotKey);
     if (encoded != null) {

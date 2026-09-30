@@ -180,11 +180,6 @@ class SolasFlowTaskHandler extends TaskHandler {
     _lastStopwatchPublishedSeconds = stopwatchSeconds;
     _lastClockMinute = clockMinute;
     await _updateNotification(runtime, stopwatch, settings);
-    FlutterForegroundTask.sendDataToMain({
-      'type': 'runtime',
-      'snapshot': runtime.toJson(),
-      'stopwatch': stopwatch.toJson(),
-    });
   }
 
   Future<void> _updateNotification(
@@ -1491,6 +1486,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
             : (timerInterval != null || currentTabIndex == 1
                   ? FullscreenFocusMode.timer
                   : FullscreenFocusMode.clock));
+    if (_fullscreenFocusOpen) return;
     _fullscreenFocusOpen = true;
     await Navigator.of(context)
         .push(
@@ -1843,52 +1839,58 @@ class _MainScreenState extends ConsumerState<MainScreen>
     setState(() => _todaySummary = parts.join(' · '));
   }
 
-  /// Show a dialog to pick Study or Non-study when launched from widget.
-  /// Returns the selected tag string, or null if cancelled.
-  Future<String?> _showTagSelectionDialog() async {
-    return showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text(
-          'Session Tag',
-          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
-        ),
-        content: const Text(
-          'How will you use this timer?',
-          style: TextStyle(fontSize: 14),
-        ),
-        actions: [
-          TextButton.icon(
-            onPressed: () => Navigator.of(ctx).pop('study'),
-            icon: const Icon(Icons.menu_book_rounded),
-            label: const Text('Study'),
-          ),
-          TextButton.icon(
-            onPressed: () => Navigator.of(ctx).pop('non-study'),
-            icon: const Icon(Icons.hourglass_top_rounded),
-            label: const Text('Non-study'),
-          ),
-        ],
-      ),
-    );
-  }
 
   /// Start a preset timer from widget (extracted for reuse with tag dialog).
-  void _startPresetFromWidget(int mins) {
+  Future<void> _startPresetFromWidget(int mins) async {
+    final safeMins = mins.clamp(1, 720);
+    final totalSeconds = safeMins * 60;
+    _armedPresetTimer?.cancel();
+    _armedPresetValue = null;
+
+    timerInterval?.cancel();
+    timerInterval = null;
+
     setState(() {
       currentTabIndex = 1;
       chainModeOn = false;
-      seconds = mins * 60;
-      final m = mins.toString().padLeft(2, '0');
-      timerValue = '$m:00';
+      chainIndex = 0;
+      sliderValue = safeMins;
+      seconds = totalSeconds;
+      _activeTimerDurationSeconds = totalSeconds;
+      timerValue = _formatTimerDisplayValue(totalSeconds);
+      timerDisplayValue = timerValue;
+      _isTimerFinished = false;
       fullscreenShowClock = true;
     });
-    startTimer();
-    _openFullscreenFocus(
-      specificMode: FullscreenFocusMode.timer,
-      forceHorizontal: true,
-      startImmersive: true,
+
+    _timerRuntime = TimerRuntime.running(
+      durationSeconds: totalSeconds,
+      remainingSeconds: totalSeconds,
+      now: DateTime.now(),
+      chainModeOn: false,
+      chainPresetKey: chainPresetKey,
+      chainIndex: 0,
+      revision: _timerRuntime.revision + 1,
     );
+
+    setState(() {
+      timerInterval = Timer.periodic(const Duration(milliseconds: 250), tick);
+    });
+
+    if (taggingOn) _sessionStartTime = DateTime.now();
+
+    await _timerRuntimeStore.save(_timerRuntime);
+    await _saveLastTimerSeconds(totalSeconds);
+    _applyAudioSettings();
+    await _reconcileForeground(force: true);
+
+    if (!_fullscreenFocusOpen) {
+      unawaited(_openFullscreenFocus(
+        specificMode: FullscreenFocusMode.timer,
+        forceHorizontal: true,
+        startImmersive: true,
+      ));
+    }
   }
 
   Future<void> _writeWidgetState() async {
@@ -2016,19 +2018,11 @@ class _MainScreenState extends ConsumerState<MainScreen>
 
     if (presetMap.containsKey(type)) {
       final mins = presetMap[type]!;
-      // If tagging is ON, show tag selection dialog first
-      if (taggingOn) {
-        final selectedTag = await _showTagSelectionDialog();
-        if (selectedTag != null) {
-          setState(() {
-            sessionTag = selectedTag;
-            _lsSave();
-          });
-          _startPresetFromWidget(mins);
-        }
-      } else {
-        _startPresetFromWidget(mins);
+      if (taggingOn && sessionTag.isEmpty) {
+        sessionTag = 'Study';
+        _lsSave();
       }
+      await _startPresetFromWidget(mins);
       return;
     }
 
@@ -2493,7 +2487,10 @@ class _MainScreenState extends ConsumerState<MainScreen>
     _handleNightUsageStateChange(state);
     if (state == AppLifecycleState.resumed) {
       _dispatchExternal(() async {
-        await _restoreTimerRuntime();
+        if (timerInterval == null ||
+            _timerRuntime.status != TimerRuntimeStatus.running) {
+          await _restoreTimerRuntime();
+        }
         await _drainWidgetActions();
         await _reconcileForeground(force: true);
       });
@@ -2832,6 +2829,10 @@ class _MainScreenState extends ConsumerState<MainScreen>
   }
 
   Future<void> _restoreTimerRuntime() async {
+    if (timerInterval != null &&
+        _timerRuntime.status == TimerRuntimeStatus.running) {
+      return;
+    }
     final runtime = await _timerRuntimeStore.load();
     if (!mounted) return;
     await _applyTimerRuntime(runtime, restored: true);
@@ -2842,9 +2843,23 @@ class _MainScreenState extends ConsumerState<MainScreen>
     bool restored = false,
   }) async {
     if (!mounted) return;
-    if (runtime.runId == _timerRuntime.runId &&
-        runtime.revision < _timerRuntime.revision) {
-      return;
+    final isLocallyRunning = timerInterval != null &&
+        _timerRuntime.status == TimerRuntimeStatus.running;
+    if (isLocallyRunning) {
+      if (runtime.status == TimerRuntimeStatus.idle) {
+        return;
+      }
+      if (runtime.runId.isNotEmpty && runtime.runId != _timerRuntime.runId) {
+        return;
+      }
+      if (runtime.revision < _timerRuntime.revision) {
+        return;
+      }
+    } else {
+      if (runtime.runId == _timerRuntime.runId &&
+          runtime.revision < _timerRuntime.revision) {
+        return;
+      }
     }
     var next = runtime;
     if (next.status == TimerRuntimeStatus.running &&
@@ -3381,9 +3396,11 @@ class _MainScreenState extends ConsumerState<MainScreen>
       }
     }
     seconds = seconds.clamp(1, 720 * 60);
-    _activeTimerDurationSeconds = _activeTimerDurationSeconds > 0
-        ? _activeTimerDurationSeconds
-        : seconds;
+    if (_timerRuntime.status != TimerRuntimeStatus.paused ||
+        _activeTimerDurationSeconds <= 0 ||
+        seconds > _activeTimerDurationSeconds) {
+      _activeTimerDurationSeconds = seconds;
+    }
     _timerRuntime = TimerRuntime.running(
       durationSeconds: _activeTimerDurationSeconds,
       remainingSeconds: seconds,
@@ -3492,28 +3509,11 @@ class _MainScreenState extends ConsumerState<MainScreen>
     unawaited(_reconcileForeground(force: true));
   }
 
-  /// Two-tap confirmation for preset grid buttons.
-  /// First tap → arms the button (shows visual), second tap → starts timer.
+  /// Starts timer preset immediately on tap.
   void _onPresetTap(int val) {
     _armedPresetTimer?.cancel();
-    if (_armedPresetValue == val) {
-      // ── Second tap: confirm, start timer ─────────────────
-      _armedPresetValue = null;
-      choosePreset(val);
-    } else {
-      // ── First tap: arm, update preview, start 3s timeout ─
-      setState(() {
-        _armedPresetValue = val;
-        sliderValue = val;
-        seconds = val * 60;
-        timerValue = '${val.toString().padLeft(2, '0')}:00';
-        timerDisplayValue = _formatTimerDisplayValue(val * 60);
-      });
-      _armedPresetTimer = Timer(const Duration(seconds: 3), () {
-        if (!mounted) return;
-        setState(() => _armedPresetValue = null);
-      });
-    }
+    _armedPresetValue = null;
+    choosePreset(val);
   }
 
   Widget _buildSpeakClockTab() {
