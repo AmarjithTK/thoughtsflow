@@ -9,6 +9,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 
 import '../models/speech_item.dart';
 import '../models/speech_model_download_status.dart';
+import 'desktop_tts_controller.dart';
 
 class SpeechService {
   static const MethodChannel _audioChannel = MethodChannel(
@@ -18,9 +19,12 @@ class SpeechService {
   Map<String, dynamic>? _sherpaManifestCache;
   String _lastEngineUsed = 'system';
   String _lastEngineDetail = 'System TTS ready';
-  bool _linuxRuntimeBootstrapAttempted = false;
+  late final DesktopTtsController _desktopOffline = DesktopTtsController(
+    _linuxRuntimeBaseDir(),
+    _desktopModelsDirectory(),
+  );
+  ValueNotifier<String> get customModelStatus => _desktopOffline.status;
 
-  static const String _sherpaReleaseTag = 'v1.12.34';
   static const String _sherpaModelsReleaseTag = 'tts-models';
   static const String _kokoroArchiveName =
       'kokoro-int8-multi-lang-v1_1.tar.bz2';
@@ -44,6 +48,7 @@ class SpeechService {
   AudioPlayer? _desktopTtsPlayer;
   int _desktopSpeechGeneration = 0;
   Completer<void>? _desktopPlaybackCompleter;
+  Process? _externalSpeechProcess;
 
   String get lastEngineUsed => _lastEngineUsed;
   String get lastEngineDetail => _lastEngineDetail;
@@ -198,26 +203,6 @@ class SpeechService {
     return result.stdout.toString().trim().split(RegExp(r'\s+')).first;
   }
 
-  Future<void> _copyDir(String src, String dst) async {
-    final srcDir = Directory(src);
-    if (!srcDir.existsSync()) return;
-    final dstDir = Directory(dst);
-    await dstDir.create(recursive: true);
-    await for (final entity in srcDir.list(
-      recursive: true,
-      followLinks: false,
-    )) {
-      final rel = entity.path.substring(srcDir.path.length + 1);
-      final targetPath = '$dst${Platform.pathSeparator}$rel';
-      if (entity is Directory) {
-        await Directory(targetPath).create(recursive: true);
-      } else if (entity is File) {
-        await File(targetPath).parent.create(recursive: true);
-        await entity.copy(targetPath);
-      }
-    }
-  }
-
   Future<void> _extractTarBz2(String archivePath, String outputDir) async {
     final result = await Process.run('tar', [
       '-xjf',
@@ -230,161 +215,103 @@ class SpeechService {
     }
   }
 
-  Future<void> _ensureLinuxRuntimeAssets() async {
-    if (!Platform.isLinux || _linuxRuntimeBootstrapAttempted) return;
-    _linuxRuntimeBootstrapAttempted = true;
-
-    final runtimeBase = _linuxRuntimeBaseDir();
-    final binBase =
-        '$runtimeBase${Platform.pathSeparator}assets${Platform.pathSeparator}tts${Platform.pathSeparator}bin${Platform.pathSeparator}linux-x64';
-    final modelsBase =
-        '$runtimeBase${Platform.pathSeparator}assets${Platform.pathSeparator}tts${Platform.pathSeparator}models';
-
-    final mustHave = <String>[
-      '$binBase${Platform.pathSeparator}sherpa-onnx-offline-tts-play',
-      '$modelsBase${Platform.pathSeparator}en${Platform.pathSeparator}primary${Platform.pathSeparator}model.onnx',
-      '$modelsBase${Platform.pathSeparator}en${Platform.pathSeparator}primary${Platform.pathSeparator}tokens.txt',
-      '$modelsBase${Platform.pathSeparator}ml${Platform.pathSeparator}primary${Platform.pathSeparator}model.onnx',
-      '$modelsBase${Platform.pathSeparator}ml${Platform.pathSeparator}primary${Platform.pathSeparator}tokens.txt',
-      '$modelsBase${Platform.pathSeparator}espeak-ng-data${Platform.pathSeparator}ml_dict',
-    ];
-    final alreadyReady = mustHave.every(_fileExists);
-    final bundledPaths = <String>[
-      'assets/tts/bin/linux-x64/sherpa-onnx-offline-tts-play',
-      'assets/tts/models/en/primary/model.onnx',
-      'assets/tts/models/en/primary/tokens.txt',
-      'assets/tts/models/ml/primary/model.onnx',
-      'assets/tts/models/ml/primary/tokens.txt',
-      'assets/tts/models/espeak-ng-data/ml_dict',
-    ];
-    if (bundledPaths.every((path) => _resolveDesktopPath(path) != null) ||
-        alreadyReady) {
-      return;
-    }
-
-    final tmpRoot =
-        '${Directory.systemTemp.path}${Platform.pathSeparator}solasflow_sherpa_bootstrap';
-    await Directory(tmpRoot).create(recursive: true);
-
-    Future<String> downloadArchive(
-      String name, {
-      String releaseTag = _sherpaReleaseTag,
-    }) async {
-      final out = '$tmpRoot${Platform.pathSeparator}$name';
-      if (_fileExists(out)) return out;
-      final url =
-          'https://github.com/k2-fsa/sherpa-onnx/releases/download/$releaseTag/$name';
-      await _downloadToFile(url: url, outPath: out);
-      return out;
-    }
-
-    Future<void> installModel({
-      required String archiveName,
-      required String onnxName,
-      required String language,
-      required String tier,
-    }) async {
-      final arc = await downloadArchive(
-        archiveName,
-        releaseTag: _sherpaModelsReleaseTag,
-      );
-      final extractDir = '$tmpRoot${Platform.pathSeparator}${language}_$tier';
-      final extractPath = Directory(extractDir);
-      if (extractPath.existsSync()) {
-        await extractPath.delete(recursive: true);
-      }
-      await extractPath.create(recursive: true);
-      await _extractTarBz2(arc, extractDir);
-
-      final topDirs = Directory(
-        extractDir,
-      ).listSync().whereType<Directory>().toList();
-      if (topDirs.isEmpty) {
-        throw Exception('No model directory in $archiveName');
-      }
-      final src = topDirs.first.path;
-      final dstDir =
-          '$modelsBase${Platform.pathSeparator}$language${Platform.pathSeparator}$tier';
-      await Directory(dstDir).create(recursive: true);
-      await File(
-        '$src${Platform.pathSeparator}$onnxName',
-      ).copy('$dstDir${Platform.pathSeparator}model.onnx');
-      await File(
-        '$src${Platform.pathSeparator}tokens.txt',
-      ).copy('$dstDir${Platform.pathSeparator}tokens.txt');
-
-      final sharedDataDir =
-          '$modelsBase${Platform.pathSeparator}espeak-ng-data';
-      if (!_dirExists(sharedDataDir)) {
-        await _copyDir(
-          '$src${Platform.pathSeparator}espeak-ng-data',
-          sharedDataDir,
-        );
-      }
-    }
-
+  Future<void> warmDesktopSpeech({required bool useMalayalamNuance}) async {
+    if (!Platform.isLinux) return;
     try {
-      final binArchive = await downloadArchive(
-        'sherpa-onnx-$_sherpaReleaseTag-linux-x64-static.tar.bz2',
-      );
-      final binExtract = '$tmpRoot${Platform.pathSeparator}bin_extract';
-      final binExtractDir = Directory(binExtract);
-      if (binExtractDir.existsSync()) {
-        await binExtractDir.delete(recursive: true);
-      }
-      await binExtractDir.create(recursive: true);
-      await _extractTarBz2(binArchive, binExtract);
-
-      final extractedRoot = binExtractDir
-          .listSync()
-          .whereType<Directory>()
-          .firstWhere((d) => d.path.contains('linux-x64-static'));
-      final sourceBin = '${extractedRoot.path}${Platform.pathSeparator}bin';
-      await Directory(binBase).create(recursive: true);
-      for (final exe in [
-        'sherpa-onnx-offline-tts-play',
-        'sherpa-onnx-offline-tts-play-alsa',
-        'sherpa-onnx-offline-tts',
-      ]) {
-        final src = '$sourceBin${Platform.pathSeparator}$exe';
-        final dst = '$binBase${Platform.pathSeparator}$exe';
-        await File(src).copy(dst);
-        await _ensureExecutableBitIfNeeded(dst);
-      }
-
-      await installModel(
-        archiveName: 'vits-piper-en_US-lessac-medium.tar.bz2',
-        onnxName: 'en_US-lessac-medium.onnx',
-        language: 'en',
-        tier: 'primary',
-      );
-      await installModel(
-        archiveName: 'vits-piper-en_US-ljspeech-medium.tar.bz2',
-        onnxName: 'en_US-ljspeech-medium.onnx',
-        language: 'en',
-        tier: 'backup',
-      );
-      await installModel(
-        archiveName: 'vits-piper-ml_IN-meera-medium.tar.bz2',
-        onnxName: 'ml_IN-meera-medium.onnx',
-        language: 'ml',
-        tier: 'primary',
-      );
-      await installModel(
-        archiveName: 'vits-piper-ml_IN-arjun-medium.tar.bz2',
-        onnxName: 'ml_IN-arjun-medium.onnx',
-        language: 'ml',
-        tier: 'backup',
-      );
+      final model = await _persistentModel(useMalayalamNuance ? 'ml' : 'en');
+      await _desktopOffline.engine.warm(_desktopOffline.library, model);
       _setEngineStatus(
         'sherpa_ready',
-        'Downloaded Linux Sherpa runtime and fallback voices',
+        '${model['name']} loaded; persistent offline runtime ready',
       );
     } catch (error) {
       _setEngineStatus(
-        'sherpa_download_failed',
-        'Runtime setup failed: $error',
+        'sherpa_unavailable',
+        'Offline voice setup failed: $error',
       );
+      customModelStatus.value = _lastEngineDetail;
+    }
+  }
+
+  Future<void> importDesktopModel(
+    String directory, {
+    required String language,
+  }) async {
+    if (!Platform.isLinux) {
+      throw UnsupportedError('Local model import is Linux-only');
+    }
+    await stopDesktopSpeech();
+    await _desktopOffline.importModel(directory, language);
+  }
+
+  Future<void> clearDesktopModel(String language) async {
+    if (!Platform.isLinux) return;
+    await stopDesktopSpeech();
+    await _desktopOffline.clearModel(language);
+  }
+
+  Future<Map<String, dynamic>> _persistentModel(String language) async {
+    await _desktopOffline.initialize();
+    final imported = _desktopOffline.selected(language);
+    if (imported != null) return imported;
+    if (language == 'en' && _kokoroModelInstalled()) {
+      return {
+        'language': 'en',
+        'type': 'kokoro',
+        'model': _joinPath(_kokoroModelDirectory(), 'model.int8.onnx'),
+        'tokens': _joinPath(_kokoroModelDirectory(), 'tokens.txt'),
+        'voices': _joinPath(_kokoroModelDirectory(), 'voices.bin'),
+        'lexicon': _joinPath(_kokoroModelDirectory(), 'lexicon-us-en.txt'),
+        'data': _joinPath(_kokoroModelDirectory(), 'espeak-ng-data'),
+        'speaker': 0,
+        'name': 'Kokoro v1.1 INT8 English (Maple)',
+      };
+    }
+    return _desktopOffline.builtIn(language);
+  }
+
+  Future<bool> _speakPersistentLinux({
+    required String text,
+    required bool useMalayalamNuance,
+    required double volume,
+  }) async {
+    final generation = _desktopSpeechGeneration;
+    final outFile = File(
+      '${Directory.systemTemp.path}/solasflow_${DateTime.now().microsecondsSinceEpoch}.wav',
+    );
+    try {
+      final model = await _persistentModel(useMalayalamNuance ? 'ml' : 'en');
+      if (generation != _desktopSpeechGeneration) return true;
+      await _desktopOffline.engine.synthesize(
+        _desktopOffline.library,
+        model,
+        text,
+        outFile.path,
+      );
+      if (generation != _desktopSpeechGeneration) return true;
+      final played = await _playWaveFile(
+        outFile.path,
+        volume: volume,
+        generation: generation,
+      );
+      if (generation != _desktopSpeechGeneration) return true;
+      if (played) {
+        _setEngineStatus(
+          'sherpa',
+          '${model['name']} · warm native model reused',
+        );
+      }
+      return played;
+    } catch (error) {
+      if (generation != _desktopSpeechGeneration) return true;
+      _setEngineStatus(
+        'sherpa_unavailable',
+        'Persistent offline speech failed: $error',
+      );
+      customModelStatus.value = _lastEngineDetail;
+      return false;
+    } finally {
+      if (await outFile.exists()) await outFile.delete();
     }
   }
 
@@ -401,6 +328,8 @@ class SpeechService {
       'tokens.txt',
       'voices.bin',
       'lexicon-us-en.txt',
+      'espeak-ng-data/phontab',
+      'espeak-ng-data/en_dict',
     ].every((name) => _fileExists(_joinPath(_kokoroModelDirectory(), name)));
   }
 
@@ -508,6 +437,13 @@ class SpeechService {
       )) {
         throw Exception('Kokoro archive is missing required model files');
       }
+      final languageData = Directory(_joinPath(sourceDir, 'espeak-ng-data'));
+      if (![
+        'phontab',
+        'en_dict',
+      ].every((name) => _fileExists(_joinPath(languageData.path, name)))) {
+        throw Exception('Kokoro archive is missing matching language data');
+      }
 
       kokoroDownloadStatus.value = const SpeechModelDownloadStatus(
         phase: SpeechModelDownloadPhase.installing,
@@ -523,6 +459,21 @@ class SpeechService {
         await File(
           _joinPath(sourceDir, name),
         ).copy(_joinPath(stagingDir.path, name));
+      }
+      await for (final entity in languageData.list(
+        recursive: true,
+        followLinks: false,
+      )) {
+        final relative = entity.path.substring(sourceDir.length + 1);
+        final target = _joinPath(stagingDir.path, relative);
+        if (entity is Directory) {
+          await Directory(target).create(recursive: true);
+        } else if (entity is File) {
+          await File(target).parent.create(recursive: true);
+          await entity.copy(target);
+        } else {
+          throw Exception('Kokoro language data contains an unsupported entry');
+        }
       }
 
       final installedDir = Directory(kokoroDir);
@@ -578,7 +529,9 @@ class SpeechService {
     final normalized = _normalizeSep(pathLike.trim());
 
     if (_looksAbsolutePath(normalized)) {
-      return File(normalized).existsSync() ? normalized : null;
+      return _fileExists(normalized) || _dirExists(normalized)
+          ? normalized
+          : null;
     }
 
     final candidates = <String>{};
@@ -605,35 +558,43 @@ class SpeechService {
     }
 
     for (final candidate in candidates) {
-      if (File(candidate).existsSync()) {
+      if (_fileExists(candidate) || _dirExists(candidate)) {
         return candidate;
       }
     }
     return null;
   }
 
-  Future<void> _ensureExecutableBitIfNeeded(String executablePath) async {
-    if (!Platform.isLinux) return;
-    try {
-      await Process.run('chmod', ['+x', executablePath]);
-    } catch (_) {
-      // Non-fatal; execution may still work depending on packaging.
-    }
+  String? _desktopModelsDirectory() {
+    final phontab = _resolveDesktopPath(
+      'assets/tts/models/espeak-ng-data/phontab',
+    );
+    return phontab == null ? null : File(phontab).parent.parent.path;
   }
 
   Future<bool> _runExternal(String executable, List<String> args) async {
+    final generation = _desktopSpeechGeneration;
+    Process? process;
     try {
-      final result = await Process.run(executable, args);
-      if (result.exitCode != 0) {
-        final stderr = result.stderr.toString().trim();
-        if (stderr.isNotEmpty) {
-          debugPrint('Speech command failed ($executable): $stderr');
-        }
+      process = await Process.start(executable, args);
+      _externalSpeechProcess = process;
+      if (generation != _desktopSpeechGeneration) process.kill();
+      final stdoutDone = process.stdout.drain<void>();
+      final stderrDone = utf8.decoder.bind(process.stderr).join();
+      final exitCode = await process.exitCode;
+      await stdoutDone;
+      final stderr = (await stderrDone).trim();
+      if (exitCode != 0 && stderr.isNotEmpty) {
+        debugPrint('Speech command failed ($executable): $stderr');
       }
-      return result.exitCode == 0;
+      return exitCode == 0;
     } catch (error) {
       debugPrint('Unable to run speech command ($executable): $error');
       return false;
+    } finally {
+      if (identical(_externalSpeechProcess, process)) {
+        _externalSpeechProcess = null;
+      }
     }
   }
 
@@ -674,6 +635,8 @@ class SpeechService {
 
   Future<void> stopDesktopSpeech() async {
     _desktopSpeechGeneration++;
+    if (Platform.isLinux) _desktopOffline.engine.cancel();
+    _externalSpeechProcess?.kill();
     final completed = _desktopPlaybackCompleter;
     if (completed != null && !completed.isCompleted) completed.complete();
     try {
@@ -689,6 +652,7 @@ class SpeechService {
     final player = _desktopTtsPlayer;
     _desktopTtsPlayer = null;
     if (player != null) await player.dispose();
+    if (Platform.isLinux) await _desktopOffline.close();
   }
 
   Future<bool> _speakOnLinuxFallback({
@@ -696,6 +660,7 @@ class SpeechService {
     required bool useMalayalamNuance,
   }) async {
     final voice = _linuxEspeakVoice(useMalayalamNuance: useMalayalamNuance);
+    final generation = _desktopSpeechGeneration;
 
     // Ordered fallback chain for Linux desktop distributions.
     final commands = <({String exe, List<String> args})>[
@@ -705,7 +670,9 @@ class SpeechService {
     ];
 
     for (final command in commands) {
+      if (generation != _desktopSpeechGeneration) return true;
       final ok = await _runExternal(command.exe, command.args);
+      if (generation != _desktopSpeechGeneration) return true;
       if (ok) {
         _setEngineStatus('linux_fallback', '${command.exe} succeeded');
         return true;
@@ -788,8 +755,6 @@ class SpeechService {
         'sherpa-onnx-offline-tts-play.exe',
         'sherpa-onnx-tts-play.exe',
       ]);
-    } else {
-      names.addAll(['sherpa-onnx-offline-tts-play', 'sherpa-onnx-tts-play']);
     }
 
     final ordered = <String>[];
@@ -806,7 +771,6 @@ class SpeechService {
           ? _resolveDesktopPath(candidate)
           : null;
       if (resolvedPath != null) {
-        await _ensureExecutableBitIfNeeded(resolvedPath);
         resolved.add(resolvedPath);
       } else {
         resolved.add(candidate);
@@ -821,11 +785,15 @@ class SpeechService {
     required double volume,
   }) async {
     if (!(Platform.isLinux || Platform.isWindows)) return false;
+    if (Platform.isLinux) {
+      return _speakPersistentLinux(
+        text: text,
+        useMalayalamNuance: useMalayalamNuance,
+        volume: volume,
+      );
+    }
 
     final generation = _desktopSpeechGeneration;
-    if (Platform.isLinux) {
-      await _ensureLinuxRuntimeAssets();
-    }
     if (generation != _desktopSpeechGeneration) return true;
 
     final manifest = await _loadSherpaManifest();
@@ -896,7 +864,6 @@ class SpeechService {
         final isFileGenerator =
             lowerCommand.endsWith('offline-tts') ||
             lowerCommand.endsWith('offline-tts.exe');
-        if (Platform.isLinux && !isFileGenerator) continue;
 
         if (isFileGenerator) {
           final outFile =
@@ -929,7 +896,6 @@ class SpeechService {
             }
             if (generation != _desktopSpeechGeneration) return true;
           }
-          if (Platform.isLinux) continue;
         }
 
         final ok = await _runExternal(command, [...baseModelArgs(), text]);
@@ -944,7 +910,7 @@ class SpeechService {
       }
 
       final extraArgs = model['commandArgs'];
-      if (extraArgs is List && extraArgs.isNotEmpty && !Platform.isLinux) {
+      if (extraArgs is List && extraArgs.isNotEmpty) {
         for (final command in commands) {
           final ok = await _runExternal(
             command,

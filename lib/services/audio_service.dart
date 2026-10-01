@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter/foundation.dart';
 
 class AudioService {
   final AudioPlayer _backgroundPlayer = AudioPlayer();
@@ -10,6 +11,9 @@ class AudioService {
   Timer? _notificationStopTimer;
   int _backgroundRevision = 0;
   int _notificationRevision = 0;
+  int _volumeRevision = 0;
+  double _configuredVolume = 1;
+  bool _speechDucking = false;
   String? _activeAsset;
   double? _activeVolume;
   bool _backgroundPlaying = false;
@@ -26,6 +30,8 @@ class AudioService {
   }) {
     final revision = ++_backgroundRevision;
     final safeVolume = volume.clamp(0, 1).toDouble();
+    _configuredVolume = safeVolume;
+    ++_volumeRevision;
     return _enqueue(() async {
       if (_disposed || revision != _backgroundRevision) return;
       if (!shouldPlay) {
@@ -33,9 +39,10 @@ class AudioService {
         _backgroundPlaying = false;
         return;
       }
-      if (_activeVolume != safeVolume) {
-        await _backgroundPlayer.setVolume(safeVolume);
-        _activeVolume = safeVolume;
+      final effectiveVolume = _effectiveVolume;
+      if (_activeVolume != effectiveVolume) {
+        await _backgroundPlayer.setVolume(effectiveVolume);
+        _activeVolume = effectiveVolume;
       }
       if (!_backgroundPlaying || _activeAsset != assetPath) {
         await _backgroundPlayer.play(AssetSource(assetPath));
@@ -47,11 +54,56 @@ class AudioService {
 
   Future<void> stopBackground() {
     final revision = ++_backgroundRevision;
+    ++_volumeRevision;
     return _enqueue(() async {
       if (_disposed || revision != _backgroundRevision) return;
       await _backgroundPlayer.pause();
       _backgroundPlaying = false;
     });
+  }
+
+  double get _effectiveVolume =>
+      _configuredVolume * (_speechDucking ? 0.25 : 1);
+
+  /// Temporarily attenuates ambient audio without changing its configured level.
+  /// Calls share the player operation queue, and newer volume/mute requests
+  /// invalidate any in-progress ramp before it can restore an obsolete level.
+  Future<void> setSpeechDucking(bool active) {
+    if (_disposed || active == _speechDucking) return _operationTail;
+    _speechDucking = active;
+    final revision = ++_volumeRevision;
+    debugPrint('[AudioService] Speech ducking ${active ? 'on' : 'off'}');
+    return _enqueue(() async {
+      if (_disposed || revision != _volumeRevision || !_backgroundPlaying) {
+        return;
+      }
+      await _rampBackgroundVolume(revision);
+    });
+  }
+
+  Future<void> _rampBackgroundVolume(int revision) async {
+    final target = _effectiveVolume;
+    final start = _activeVolume ?? target;
+    if (start == target) return;
+    const duration = Duration(milliseconds: 350);
+    const interval = Duration(milliseconds: 25);
+    final elapsed = Stopwatch()..start();
+    debugPrint('[AudioService] Ambient volume ramp $start -> $target');
+    while (!_disposed && revision == _volumeRevision) {
+      final progress = (elapsed.elapsedMicroseconds / duration.inMicroseconds)
+          .clamp(0.0, 1.0);
+      // Smoothstep eases both ends while still reaching the requested level.
+      final eased = progress * progress * (3 - 2 * progress);
+      final volume = start + (target - start) * eased;
+      await _backgroundPlayer.setVolume(volume);
+      _activeVolume = volume;
+      if (progress >= 1) {
+        debugPrint('[AudioService] Ambient volume ramp complete');
+        return;
+      }
+      await Future<void>.delayed(interval);
+    }
+    debugPrint('[AudioService] Ambient volume ramp cancelled');
   }
 
   Future<void> playNotification({
@@ -93,6 +145,7 @@ class AudioService {
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
+    ++_volumeRevision;
     _notificationStopTimer?.cancel();
     await _operationTail.catchError((Object _) {});
     await _backgroundPlayer.dispose();

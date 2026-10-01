@@ -86,6 +86,7 @@ import 'models/speech_item.dart';
 import 'models/sound_option.dart';
 import 'services/audio_service.dart';
 import 'services/foreground_notification_service.dart';
+import 'services/desktop_service.dart';
 import 'services/malayalam_tts_service.dart';
 import 'services/settings_service.dart';
 import 'services/speech_service.dart';
@@ -96,6 +97,7 @@ import 'features/motivation/services/quote_rotation_service.dart';
 import 'widgets/clock_panel.dart';
 import 'widgets/fullscreen_focus_view.dart';
 import 'widgets/timer_panel.dart';
+import 'widgets/drive_mode_view.dart';
 import 'widgets/stopwatch_panel.dart';
 import 'widgets/settings_panel.dart';
 import 'widgets/help_panel.dart';
@@ -384,6 +386,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
   /// Plays ambient background sounds (rain, waterfall, fire, stream)
   /// Handles volume and audio session management
   final AudioService _audioService = AudioService();
+  final DesktopService _desktopService = DesktopService();
 
   /// Loads/saves AppSettings from SharedPreferences with versioned migrations
   /// Ensures data compatibility across app versions
@@ -414,6 +417,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
   final TimerRuntimeStore _timerRuntimeStore = TimerRuntimeStore();
   TimerRuntime _timerRuntime = TimerRuntime.idle();
   bool _timerCompletionInFlight = false;
+  bool _exiting = false;
+  bool _driveModeOpen = false;
   int _alarmGeneration = 0;
   bool _bootstrapReady = false;
   final List<Future<void> Function()> _pendingExternalActions = [];
@@ -955,6 +960,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
       _isTimerFinished;
 
   Future<void> _reconcileForeground({bool force = false}) async {
+    if (Platform.isLinux) return;
     final ok = await _foregroundNotificationService.reconcile(
       shouldRun: _isAnythingActive,
       state: _foregroundState(),
@@ -1139,6 +1145,14 @@ class _MainScreenState extends ConsumerState<MainScreen>
         transitionDuration: const Duration(milliseconds: 250),
         reverseTransitionDuration: const Duration(milliseconds: 200),
         pageBuilder: (context, animation, secondaryAnimation) => SettingsPanel(
+          onAppDarkThemeChanged: (val) {
+            if (val == null || val == appDarkTheme) return;
+            setState(() {
+              appDarkTheme = val;
+              _lsSave();
+            });
+            debugPrint('[UI] App dark theme enabled=$val');
+          },
           onAppFontSizeMultiplierChanged: (val) {
             if (val != null) {
               setState(() {
@@ -1177,6 +1191,11 @@ class _MainScreenState extends ConsumerState<MainScreen>
           onDownloadEnglishVoice: _downloadKokoroVoiceFromSettings,
           onCancelEnglishVoiceDownload: () =>
               unawaited(_speechService.cancelKokoroVoiceDownload()),
+          customModelStatus: _speechService.customModelStatus,
+          onImportDesktopModel: (directory, language) =>
+              _speechService.importDesktopModel(directory, language: language),
+          onClearDesktopModel: (language) =>
+              _speechService.clearDesktopModel(language),
           onTestSpeech: _testSpeech,
           voices: settingsVoices,
           availableEngines: _installedEngines,
@@ -1474,6 +1493,113 @@ class _MainScreenState extends ConsumerState<MainScreen>
     unawaited(_reconcileForeground(force: true));
   }
 
+  Future<void> _openDriveMode({bool fullscreen = false}) async {
+    if (_driveModeOpen || _fullscreenFocusOpen) return;
+    _driveModeOpen = true;
+    debugPrint('[UI] Opening Drive Mode fullscreen=$fullscreen');
+    try {
+      if (Platform.isLinux && fullscreen) {
+        await _desktopService.setFullscreen(true);
+      }
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (driveContext) => DriveModeView(
+            initialMode: DriveMode.values[currentTabIndex],
+            clockTextBuilder: () => currentTimeDisplay,
+            timerTextBuilder: () => timerDisplayValue,
+            stopwatchTextBuilder: () => stopwatchElapsedValue,
+            isTimerRunningBuilder: () => timerInterval != null,
+            isStopwatchRunningBuilder: () => stopwatchInterval != null,
+            isTimerPausedBuilder: () =>
+                _timerRuntime.status == TimerRuntimeStatus.paused,
+            isStopwatchPausedBuilder: () =>
+                !_stopwatchRuntime.isRunning &&
+                _stopwatchRuntime.accumulatedMs > 0,
+            audioEnabledBuilder: () => speechMasterOn,
+            onTimerStart: () {
+              final paused = _timerRuntime.status == TimerRuntimeStatus.paused;
+              startTimer();
+              speak(paused ? 'Timer resumed' : 'Timer started');
+            },
+            onTimerPause: () {
+              stopTimer();
+              speak('Timer paused');
+            },
+            onStopwatchStart: () {
+              final paused = _stopwatchRuntime.accumulatedMs > 0;
+              startStopwatch();
+              speak(paused ? 'Stopwatch resumed' : 'Stopwatch started');
+            },
+            onStopwatchPause: () {
+              stopStopwatch();
+              speak('Stopwatch paused');
+            },
+            onAudioEnabledChanged: (enabled) =>
+                unawaited(_setSpeechMaster(enabled)),
+            onModeChanged: (mode) =>
+                setState(() => currentTabIndex = mode.index),
+            onTimerPresetSelected: (minutes) {
+              _startTimerFromMinutes(minutes);
+              speak('$minutes minute timer started');
+            },
+            onSpeakNow: (mode) {
+              switch (mode) {
+                case DriveMode.clock:
+                  speak(timeToWords());
+                case DriveMode.timer:
+                  speak('$seconds seconds remaining');
+                case DriveMode.stopwatch:
+                  speakStopwatchElapsedNow();
+              }
+            },
+            onClose: () => Navigator.of(driveContext).pop(),
+          ),
+        ),
+      );
+    } finally {
+      _driveModeOpen = false;
+      if (Platform.isLinux && fullscreen) {
+        await _desktopService.setFullscreen(false);
+      }
+    }
+  }
+
+  Future<void> _handleDesktopAction(String action) async {
+    try {
+      switch (action) {
+        case 'drive':
+          await _openDriveMode();
+        case 'drive_fullscreen':
+          await _openDriveMode(fullscreen: true);
+        case 'background':
+          await _desktopService.setBackgroundEnabled(
+            !_desktopService.backgroundEnabled.value,
+          );
+        case 'top':
+          await _desktopService.setAlwaysOnTop(
+            !_desktopService.alwaysOnTop.value,
+          );
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text(DesktopService.alwaysOnTopNote)),
+            );
+          }
+        case 'hide':
+          await _desktopService.setBackgroundEnabled(true);
+          await _desktopService.hide();
+      }
+      if (mounted) setState(() {});
+    } catch (error, stackTrace) {
+      debugPrint('[ERROR] Desktop action $action failed: $error\n$stackTrace');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Desktop action failed: $error')),
+        );
+      }
+    }
+  }
+
   Future<void> _openFullscreenFocus({
     FullscreenFocusMode? specificMode,
     bool forceHorizontal = false,
@@ -1558,6 +1684,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
   }
 
   Future<void> _exitAppFully() async {
+    if (_exiting) return;
+    _exiting = true;
     try {
       stopClock();
       timerInterval?.cancel();
@@ -1571,6 +1699,10 @@ class _MainScreenState extends ConsumerState<MainScreen>
       await _audioService.stopBackground();
       await _audioService.stopNotification();
       await _stopForegroundService();
+      if (Platform.isLinux) {
+        await _speechService.disposeDesktopSpeech();
+        await _settingsService.flush();
+      }
     } catch (error, stackTrace) {
       debugPrint('Exit cleanup failed: $error\n$stackTrace');
     }
@@ -1578,6 +1710,10 @@ class _MainScreenState extends ConsumerState<MainScreen>
     if (!mounted) return;
     if (Platform.isAndroid || Platform.isIOS) {
       await SystemNavigator.pop();
+      return;
+    }
+    if (Platform.isLinux) {
+      await _desktopService.quit();
       return;
     }
     exit(0);
@@ -1653,6 +1789,12 @@ class _MainScreenState extends ConsumerState<MainScreen>
     }
   }
 
+  void _stopMobileRingtone() {
+    if (Platform.isAndroid || Platform.isIOS) {
+      FlutterRingtonePlayer().stop();
+    }
+  }
+
   Future<void> _setSpeechMaster(bool enabled) async {
     if (!mounted) return;
     if (speechMasterOn == enabled) {
@@ -1664,7 +1806,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
       _cancelPendingSpeech();
       await _stopTts();
       await _audioService.stopBackground();
-      FlutterRingtonePlayer().stop();
+      _stopMobileRingtone();
     } else {
       _applyAudioSettings();
     }
@@ -1675,7 +1817,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
 
   Future<void> _dismissFinishedTimer() async {
     if (!mounted) return;
-    FlutterRingtonePlayer().stop();
+    _stopMobileRingtone();
     _timerRuntime = TimerRuntime.idle().copyWith(
       revision: _timerRuntime.revision + 1,
     );
@@ -1735,6 +1877,18 @@ class _MainScreenState extends ConsumerState<MainScreen>
     );
 
     await _audioService.init();
+    if (Platform.isLinux) {
+      _desktopService.onQuitRequested = () => unawaited(_exitAppFully());
+      await _desktopService.initialize();
+      if (_speechService.normalizeSpeechEngineMode(speechEngineMode) !=
+          'system_only') {
+        unawaited(
+          _speechService.warmDesktopSpeech(
+            useMalayalamNuance: _isMalayalamActive(getPreferredVoice()),
+          ),
+        );
+      }
+    }
     if (!mounted) return;
     unawaited(_initTts());
     _applyAudioSettings();
@@ -1839,7 +1993,6 @@ class _MainScreenState extends ConsumerState<MainScreen>
     setState(() => _todaySummary = parts.join(' · '));
   }
 
-
   /// Start a preset timer from widget (extracted for reuse with tag dialog).
   Future<void> _startPresetFromWidget(int mins) async {
     final safeMins = mins.clamp(1, 720);
@@ -1885,11 +2038,13 @@ class _MainScreenState extends ConsumerState<MainScreen>
     await _reconcileForeground(force: true);
 
     if (!_fullscreenFocusOpen) {
-      unawaited(_openFullscreenFocus(
-        specificMode: FullscreenFocusMode.timer,
-        forceHorizontal: true,
-        startImmersive: true,
-      ));
+      unawaited(
+        _openFullscreenFocus(
+          specificMode: FullscreenFocusMode.timer,
+          forceHorizontal: true,
+          startImmersive: true,
+        ),
+      );
     }
   }
 
@@ -2191,11 +2346,14 @@ class _MainScreenState extends ConsumerState<MainScreen>
   }
 
   Future<void> _stopTts() async {
-    if (Platform.isLinux || Platform.isWindows) {
-      await _speechService.stopDesktopSpeech();
+    try {
+      if (Platform.isLinux || Platform.isWindows) {
+        await _speechService.stopDesktopSpeech();
+      }
+      if (!Platform.isLinux) await flutterTts.stop();
+    } finally {
+      if (Platform.isLinux) await _audioService.setSpeechDucking(false);
     }
-    if (Platform.isLinux) return;
-    await flutterTts.stop();
   }
 
   Future<bool> _initTts({bool forceRebind = false}) async {
@@ -2353,6 +2511,15 @@ class _MainScreenState extends ConsumerState<MainScreen>
 
     final preferredVoice = getPreferredVoice();
     try {
+      if (Platform.isLinux) {
+        await _audioService.setSpeechDucking(true);
+        if (!mounted || generation != _speechGeneration || _isAudioMuted()) {
+          return;
+        }
+        if (_desktopService.hidden.value) {
+          unawaited(_desktopService.notify('Solas Flow', item.text));
+        }
+      }
       await _speechService.speakItem(
         flutterTts: flutterTts,
         item: item,
@@ -2382,6 +2549,12 @@ class _MainScreenState extends ConsumerState<MainScreen>
         } catch (retryError) {
           debugPrint('TTS retry failed: $retryError');
         }
+      }
+    } finally {
+      if (Platform.isLinux &&
+          generation == _speechGeneration &&
+          (speechQueue.isEmpty || speechQueue.first.delayMs > 0)) {
+        await _audioService.setSpeechDucking(false);
       }
     }
     if (!mounted) return;
@@ -2443,7 +2616,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
       _cancelPendingSpeech();
       unawaited(_audioService.stopBackground());
       unawaited(_audioService.stopNotification());
-      FlutterRingtonePlayer().stop();
+      _stopMobileRingtone();
     });
   }
 
@@ -2843,7 +3016,8 @@ class _MainScreenState extends ConsumerState<MainScreen>
     bool restored = false,
   }) async {
     if (!mounted) return;
-    final isLocallyRunning = timerInterval != null &&
+    final isLocallyRunning =
+        timerInterval != null &&
         _timerRuntime.status == TimerRuntimeStatus.running;
     if (isLocallyRunning) {
       if (runtime.status == TimerRuntimeStatus.idle) {
@@ -3002,6 +3176,14 @@ class _MainScreenState extends ConsumerState<MainScreen>
       });
       _applyAudioSettings();
       await _reconcileForeground(force: true);
+      if (Platform.isLinux) {
+        unawaited(
+          _desktopService.notify(
+            'Timer finished',
+            '${(_lastFinishedTimerDurationSeconds / 60).ceil()} minute timer completed.',
+          ),
+        );
+      }
 
       if (taggingOn && _sessionStartTime != null) {
         _logCurrentSession(_lastFinishedTimerDurationSeconds);
@@ -3020,7 +3202,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
         FlutterRingtonePlayer().playAlarm(looping: true);
         Future<void>.delayed(const Duration(seconds: 30), () {
           if (_alarmGeneration == alarmGeneration) {
-            FlutterRingtonePlayer().stop();
+            _stopMobileRingtone();
           }
         });
       } else if (!_isAudioMuted()) {
@@ -3039,7 +3221,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
 
   void _startTimerFromMinutes(int minutes) {
     final safeMinutes = minutes.clamp(1, 720).toInt();
-    FlutterRingtonePlayer().stop();
+    _stopMobileRingtone();
     stopTimer();
     setState(() {
       _isTimerFinished = false;
@@ -3062,7 +3244,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
     final selectedMinutes = _fullscreenFocusOpen
         ? await _showFullscreenTimerFinishedDialog()
         : await _showNormalTimerFinishedDialog();
-    FlutterRingtonePlayer().stop();
+    _stopMobileRingtone();
     _timerFinishedDialogOpen = false;
 
     if (!mounted) return;
@@ -3883,6 +4065,7 @@ class _MainScreenState extends ConsumerState<MainScreen>
     }
     unawaited(_settingsService.flush());
     unawaited(_audioService.dispose());
+    _desktopService.dispose();
     // Remove callback to avoid memory leaks
     FlutterForegroundTask.removeTaskDataCallback(_onReceiveTaskData);
     super.dispose();
@@ -3923,6 +4106,37 @@ class _MainScreenState extends ConsumerState<MainScreen>
                 tooltip: 'Focus mode',
                 icon: const Icon(Icons.fullscreen_rounded),
               ),
+              if (Platform.isLinux)
+                PopupMenuButton<String>(
+                  tooltip: 'Desktop controls',
+                  onSelected: (action) =>
+                      unawaited(_handleDesktopAction(action)),
+                  itemBuilder: (_) => [
+                    const PopupMenuItem(
+                      value: 'drive',
+                      child: Text('Drive Mode — compact'),
+                    ),
+                    const PopupMenuItem(
+                      value: 'drive_fullscreen',
+                      child: Text('Drive Mode — fullscreen'),
+                    ),
+                    const PopupMenuDivider(),
+                    CheckedPopupMenuItem(
+                      value: 'background',
+                      checked: _desktopService.backgroundEnabled.value,
+                      child: const Text('Keep running when closed'),
+                    ),
+                    CheckedPopupMenuItem(
+                      value: 'top',
+                      checked: _desktopService.alwaysOnTop.value,
+                      child: const Text('Always on top (desktop hint)'),
+                    ),
+                    const PopupMenuItem(
+                      value: 'hide',
+                      child: Text('Hide to background'),
+                    ),
+                  ],
+                ),
               IconButton(
                 onPressed: () => unawaited(_exitAppFully()),
                 tooltip: 'Exit',

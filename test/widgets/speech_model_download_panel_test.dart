@@ -13,6 +13,7 @@ void main() {
         phase: SpeechModelDownloadPhase.notDownloaded,
       ),
     );
+    final customModelStatus = ValueNotifier('Using bundled voices');
     var downloadRequests = 0;
     var cancelRequests = 0;
 
@@ -30,6 +31,9 @@ void main() {
               speechEngineRuntimeDetail: 'Piper fallback ready',
               showEnglishVoiceDownload: true,
               speechModelDownloadStatus: status,
+              customModelStatus: customModelStatus,
+              onImportDesktopModel: (_, _) async {},
+              onClearDesktopModel: (_) async {},
               sleepStartLabel: '10:00 PM',
               sleepEndLabel: '7:00 AM',
               onSoundChanged: (_) {},
@@ -37,6 +41,7 @@ void main() {
               onSpeakVolumeChanged: (_) {},
               onMaximumSpeechVolumeChanged: (_) {},
               onSpeechMasterOnChanged: (_) {},
+              onAppDarkThemeChanged: (_) {},
               onAppFontSizeMultiplierChanged: (_) {},
               onFullscreenDarkThemeChanged: (_) {},
               onFullscreenDimBrightnessChanged: (_) {},
@@ -87,5 +92,6 @@ void main() {
 
     await tester.pumpWidget(const SizedBox());
     status.dispose();
+    customModelStatus.dispose();
   });
 }

@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models/sound_option.dart';
@@ -19,6 +20,10 @@ class SettingsPanel extends ConsumerStatefulWidget {
   final String speechEngineRuntimeDetail;
   final bool showEnglishVoiceDownload;
   final ValueListenable<SpeechModelDownloadStatus> speechModelDownloadStatus;
+  final ValueListenable<String> customModelStatus;
+  final Future<void> Function(String directory, String language)
+  onImportDesktopModel;
+  final Future<void> Function(String language) onClearDesktopModel;
   final String sleepStartLabel;
   final String sleepEndLabel;
   final ValueChanged<String?> onSoundChanged;
@@ -26,6 +31,7 @@ class SettingsPanel extends ConsumerStatefulWidget {
   final ValueChanged<double?> onSpeakVolumeChanged;
   final ValueChanged<bool?> onMaximumSpeechVolumeChanged;
   final ValueChanged<bool?> onSpeechMasterOnChanged;
+  final ValueChanged<bool?> onAppDarkThemeChanged;
   final ValueChanged<double?> onAppFontSizeMultiplierChanged;
   final ValueChanged<bool?> onFullscreenDarkThemeChanged;
   final ValueChanged<bool?> onFullscreenDimBrightnessChanged;
@@ -59,6 +65,9 @@ class SettingsPanel extends ConsumerStatefulWidget {
     required this.speechEngineRuntimeDetail,
     required this.showEnglishVoiceDownload,
     required this.speechModelDownloadStatus,
+    required this.customModelStatus,
+    required this.onImportDesktopModel,
+    required this.onClearDesktopModel,
     required this.sleepStartLabel,
     required this.sleepEndLabel,
     required this.onSoundChanged,
@@ -66,6 +75,7 @@ class SettingsPanel extends ConsumerStatefulWidget {
     required this.onSpeakVolumeChanged,
     required this.onMaximumSpeechVolumeChanged,
     required this.onSpeechMasterOnChanged,
+    required this.onAppDarkThemeChanged,
     required this.onAppFontSizeMultiplierChanged,
     required this.onFullscreenDarkThemeChanged,
     required this.onFullscreenDimBrightnessChanged,
@@ -93,6 +103,131 @@ class SettingsPanel extends ConsumerStatefulWidget {
 }
 
 class _SettingsPanelState extends ConsumerState<SettingsPanel> {
+  String _desktopModelLanguage = 'en';
+  bool _modelOperationBusy = false;
+
+  Future<void> _changeDesktopModel({required bool clear}) async {
+    if (_modelOperationBusy) return;
+    final language = _desktopModelLanguage;
+    setState(() => _modelOperationBusy = true);
+    try {
+      if (clear) {
+        await widget.onClearDesktopModel(language);
+      } else {
+        final directory = await FilePicker.platform.getDirectoryPath(
+          dialogTitle: 'Choose a Sherpa-converted model folder',
+        );
+        if (directory == null || !mounted) return;
+        await widget.onImportDesktopModel(directory, language);
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Offline model ${clear ? 'clear' : 'import'} failed: $error',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _modelOperationBusy = false);
+    }
+  }
+
+  Widget _desktopModelCard(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Local offline model',
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Import a trusted Sherpa-converted Piper/VITS folder or English Kokoro folder. '
+            'One self-contained ONNX file and tokens.txt are required; Kokoro also needs '
+            'voices.bin and an English lexicon. HF source weights and arbitrary ONNX models '
+            'are not supported. Only model data is copied; no imported code is executed.',
+            style: TextStyle(fontSize: 12),
+          ),
+          const SizedBox(height: 8),
+          DropdownButtonFormField<String>(
+            initialValue: _desktopModelLanguage,
+            decoration: const InputDecoration(labelText: 'Model language'),
+            items: const [
+              DropdownMenuItem(value: 'en', child: Text('English')),
+              DropdownMenuItem(value: 'ml', child: Text('Malayalam')),
+            ],
+            onChanged: _modelOperationBusy
+                ? null
+                : (value) {
+                    if (value != null) {
+                      setState(() => _desktopModelLanguage = value);
+                    }
+                  },
+          ),
+          const SizedBox(height: 8),
+          ValueListenableBuilder<String>(
+            valueListenable: widget.customModelStatus,
+            builder: (context, value, _) =>
+                Text(value, style: const TextStyle(fontSize: 12)),
+          ),
+          if (_modelOperationBusy) ...[
+            const SizedBox(height: 8),
+            const LinearProgressIndicator(),
+          ],
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton.icon(
+                onPressed: _modelOperationBusy
+                    ? null
+                    : () => _changeDesktopModel(clear: false),
+                icon: const Icon(Icons.folder_open),
+                label: const Text('Import folder'),
+              ),
+              OutlinedButton(
+                onPressed: _modelOperationBusy
+                    ? null
+                    : () => _changeDesktopModel(clear: true),
+                child: const Text('Use built-in voice'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _modelOperationBusy
+                    ? null
+                    : () {
+                        widget.onVoiceListModeChanged(
+                          _desktopModelLanguage == 'ml'
+                              ? 'malayalam'
+                              : 'english',
+                        );
+                        widget.onTestSpeech();
+                      },
+                icon: const Icon(Icons.volume_up_outlined),
+                label: Text(
+                  'Test ${_desktopModelLanguage == 'ml' ? 'Malayalam' : 'English'}',
+                ),
+              ),
+            ],
+          ),
+          const Text(
+            'Voice test also selects this speech language. System-only mode bypasses offline models.',
+            style: TextStyle(fontSize: 11),
+          ),
+        ],
+      ),
+    );
+  }
+
   String _getVolTitle(double v) {
     if (v == 0.1) return 'Very Low';
     if (v == 0.2) return 'Low';
@@ -342,11 +477,20 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
       }),
     ];
     return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: cs.surface,
       appBar: AppBar(title: const Text('Settings'), centerTitle: true),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
         children: [
+          _settingsSwitch(
+            context,
+            icon: Icons.dark_mode_rounded,
+            title: 'Dark theme',
+            subtitle: 'Use dark colors throughout the app',
+            value: s.appDarkTheme,
+            onChanged: widget.onAppDarkThemeChanged,
+          ),
+          _settingsDivider(context),
           _settingsSwitch(
             context,
             icon: s.speechMasterOn
@@ -450,6 +594,11 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> {
                 builder: (context, status, _) =>
                     _speechModelDownloadCard(context, status),
               ),
+            ),
+          if (!kIsWeb && defaultTargetPlatform == TargetPlatform.linux)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 4, 14, 8),
+              child: _desktopModelCard(context),
             ),
           _settingsOption(
             context,

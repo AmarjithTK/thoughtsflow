@@ -153,6 +153,30 @@ Linux bundles offline Sherpa-ONNX, Piper voices for English and Malayalam, and e
 
 Kokoro v1.1 currently supplies natural-sounding US English (`af_maple`) on Linux; it does not speak Malayalam. Malayalam remains offline through the bundled Piper `ml_IN-meera-medium` voice. Quality differs by language and voice; use **Settings → Test voice** to check the selected language and installed audio output. The upstream [Kokoro model](https://huggingface.co/hexgrad/Kokoro-82M) is Apache-2.0. See `assets/tts/models_manifest.json` for runtime model selection.
 
+Kokoro installation keeps its matching eSpeak language data with the model. Older caches containing only the weights are treated as incomplete; choose **Download** once to refresh them. Bundled Piper remains available until the refreshed model is ready.
+
+Linux x64 keeps the Sherpa v1.12.34 C API in a reusable worker isolate: selected models are warmed once and reused across phrases. Inference stays off the UI isolate; cancelling speech interrupts synthesis and playback. Completed phrases play as WAV audio, not streaming PCM. Startup/model-load latency and audible gaps depend on the model, CPU, and audio device; no fixed latency or gapless guarantee is made. Ambient audio ducks to 25% of its configured level during speech, with a 350 ms fade, then restores that level.
+
+#### Import a local Hugging Face / Sherpa model
+
+Download a **trusted, Sherpa-converted** Piper/VITS voice or English Kokoro model folder, then choose **Settings → Local offline model → Model language → Import folder**. HF source weights and arbitrary ONNX exports cannot be loaded directly. The folder needs exactly one self-contained `.onnx` file with Sherpa metadata and `tokens.txt`; Kokoro additionally needs matching `voices.bin` and an English `lexicon-us-en.txt` or `lexicon.txt`. Compatible bundled eSpeak data is reused unless the folder supplies its own regular `espeak-ng-data` files. External ONNX tensors, symlinks, unsupported formats, and mismatched languages are rejected before installation.
+
+Import copies model data into app-owned storage and persists separate English/Malayalam selections; it does not execute downloaded scripts. **Use built-in voice** clears the selected import. A native model is still trusted input, not a sandbox for malicious model files. Model redistribution must respect each model's license. Runtime attribution and corresponding-source links are in `assets/tts/Sherpa-runtime-NOTICE.txt` and `assets/tts/espeak-ng-LICENSE.txt`; distributors of the GPLv3 eSpeak runtime/data must also satisfy its corresponding-source obligations.
+
+### App appearance
+
+**Settings → Dark theme** switches the whole app between the fixed light and dark palettes immediately and saves the choice across launches. Settings, clock, timer, stopwatch, dialogs, and navigation follow the selected theme. **Dark fullscreen** remains a separate fullscreen-focus preference; Drive Mode is always dark. No wallpaper-derived or Material You dynamic colors are used.
+
+### Linux window and background operation
+
+- Starts at approximately **400×860**, centered and clamped to the monitor work area; remains resizable for landscape use.
+- **Desktop controls (⋮) → Keep running when closed** persists independently of audio settings. Closing then hides the window while timers and speech keep running. Relaunching presents the same process/window; X11 also offers a legacy tray **Open/Quit** menu when the desktop supports it.
+- **Hide window** enables background mode before hiding. Hidden speech and timer completion send desktop notifications with an **Open** action. Notification visibility depends on the desktop notification service.
+- **Always on top** is a window-manager hint. Wayland compositors may ignore it; use compositor window rules when necessary. Wayland does not use the legacy X11 tray.
+- **Drive Mode** provides compact or fullscreen dark controls for clock, timer, and stopwatch, large pause/resume and speak-now buttons, audio toggle, and explicit 15/25/45-minute presets. Closing Drive Mode returns to the normal interface and exits fullscreen.
+- **Exit / Quit** stops audio and timers, releases native speech engines, flushes settings, and terminates the app. Background mode does not survive process termination or make timers run while the machine is suspended. Configure Drive Mode before driving; do not interact with the screen while driving.
+
+
 ### Arch Linux package
 ```bash
 cd packaging/arch
